@@ -24,6 +24,225 @@
 #include <time.h>
 #include <FL/Fl.h>
 #include <FL/fl_draw.h>
+#include <FL/gl.h>
+
+//###################################################################
+// Portal-visibility math (Project 2).
+// World: maze lies in the XY plane, z is up. Floor z = -1,
+// ceiling z = +1, viewer z = 0.
+// View space: x_v = forward, y_v = left.
+// Screen (OpenGL 2D, origin at center): x right, y up,
+// screen_x = -focal * y_v / x_v, screen_y = focal * z / x_v.
+//###################################################################
+namespace Vis {
+
+struct Frustum {
+    float vx, vy;   // viewer location
+    float lx, ly;   // unit vector along left boundary
+    float rx, ry;   // unit vector along right boundary
+};
+
+inline float Cross2(float ax, float ay, float bx, float by) {
+    return ax * by - ay * bx;
+}
+
+// Clip segment (x1,y1)->(x2,y2) against one half-plane of the frustum.
+// isLeft==true  -> keep points to the RIGHT of left boundary
+//                 (cross(L, P-V) <= eps).
+// isLeft==false -> keep points to the LEFT of right boundary
+//                 (cross(R, P-V) >= -eps).
+// Returns false if the whole segment is outside.
+inline bool ClipToHalfPlane(const Frustum &F, bool isLeft,
+                            float &x1, float &y1, float &x2, float &y2) {
+    const float EPS = 1.0e-6f;
+    float dx = isLeft ? F.lx : F.rx;
+    float dy = isLeft ? F.ly : F.ry;
+
+    float c1 = Cross2(dx, dy, x1 - F.vx, y1 - F.vy);
+    float c2 = Cross2(dx, dy, x2 - F.vx, y2 - F.vy);
+
+    bool in1 = isLeft ? (c1 <= EPS) : (c1 >= -EPS);
+    bool in2 = isLeft ? (c2 <= EPS) : (c2 >= -EPS);
+
+    if (in1 && in2)
+        return true;
+    if (!in1 && !in2)
+        return false;
+
+    // One point in, one out: intersect segment with infinite line V + t*D.
+    float ex = x2 - x1;
+    float ey = y2 - y1;
+    float det = Cross2(dx, dy, ex, ey); // cross(D, e)
+    if (fabs(det) < 1.0e-12)
+        return false; // parallel (should not happen for straddling case)
+
+    // s = cross(D, V - A) / cross(D, e)
+    float s = Cross2(dx, dy, F.vx - x1, F.vy - y1) / det;
+    if (s < 0.0f) s = 0.0f;
+    if (s > 1.0f) s = 1.0f;
+    float ix = x1 + s * ex;
+    float iy = y1 + s * ey;
+
+    if (!in1) {
+        x1 = ix; y1 = iy;
+    } else {
+        x2 = ix; y2 = iy;
+    }
+    return true;
+}
+
+inline bool ClipEdgeToFrustum(const Frustum &F,
+                              float &x1, float &y1,
+                              float &x2, float &y2) {
+    if (!ClipToHalfPlane(F, true, x1, y1, x2, y2))
+        return false;
+    if (!ClipToHalfPlane(F, false, x1, y1, x2, y2))
+        return false;
+    float dx = x2 - x1, dy = y2 - y1;
+    if (dx * dx + dy * dy < 1.0e-12f)
+        return false;
+    return true;
+}
+
+// Restrict frustum F to the (already clipped) portal segment.
+// The new boundaries are the rays from V through the two endpoints.
+inline Frustum RestrictFrustum(const Frustum &F,
+                               float x1, float y1,
+                               float x2, float y2) {
+    float ax = x1 - F.vx, ay = y1 - F.vy;
+    float bx = x2 - F.vx, by = y2 - F.vy;
+    float alen = (float)sqrt(ax * ax + ay * ay);
+    float blen = (float)sqrt(bx * bx + by * by);
+    Frustum NF = F;
+    if (alen < 1.0e-6f || blen < 1.0e-6f) {
+        // Portal endpoint essentially at the viewer: no valid restriction.
+        NF.lx = NF.rx; NF.ly = NF.ry;
+        return NF;
+    }
+    ax /= alen; ay /= alen;
+    bx /= blen; by /= blen;
+    // cross(A,B) > 0 means B is CCW (more left) from A.
+    if (Cross2(ax, ay, bx, by) > 0.0f) {
+        NF.lx = bx; NF.ly = by;
+        NF.rx = ax; NF.ry = ay;
+    } else {
+        NF.lx = ax; NF.ly = ay;
+        NF.rx = bx; NF.ry = by;
+    }
+    return NF;
+}
+
+inline bool FrustumValid(const Frustum &F) {
+    // Left must be strictly CCW from right (positive, < 180 deg).
+    return Cross2(F.rx, F.ry, F.lx, F.ly) > 1.0e-6f;
+}
+
+// Screen-space wall quad, ordered left -> right on screen.
+struct WallQuad {
+    float sxL, sybL, sytL; // left  (bottom, top)
+    float sxR, sybR, sytR; // right (bottom, top)
+};
+
+// Project a clipped world-space edge to screen.
+// Returns false for degenerate (zero-width) walls.
+inline bool ProjectWall(float x1, float y1, float x2, float y2,
+                        float vx, float vy, float cosD, float sinD,
+                        float focal, WallQuad &q) {
+    float dx1 = x1 - vx, dy1 = y1 - vy;
+    float dx2 = x2 - vx, dy2 = y2 - vy;
+    float xf1 = dx1 * cosD + dy1 * sinD;   // forward
+    float yl1 = -dx1 * sinD + dy1 * cosD;  // left
+    float xf2 = dx2 * cosD + dy2 * sinD;
+    float yl2 = -dx2 * sinD + dy2 * cosD;
+
+    // Frustum clipping guarantees xf > 0; guard against degeneracy.
+    if (xf1 < 1.0e-6f) xf1 = 1.0e-6f;
+    if (xf2 < 1.0e-6f) xf2 = 1.0e-6f;
+
+    float sx1 = -focal * yl1 / xf1;
+    float sx2 = -focal * yl2 / xf2;
+    float yb1 = -focal / xf1, yt1 = focal / xf1;
+    float yb2 = -focal / xf2, yt2 = focal / xf2;
+
+    // Order left->right on screen to avoid bow-tie quads.
+    if (sx1 <= sx2) {
+        q.sxL = sx1; q.sybL = yb1; q.sytL = yt1;
+        q.sxR = sx2; q.sybR = yb2; q.sytR = yt2;
+    } else {
+        q.sxL = sx2; q.sybL = yb2; q.sytL = yt2;
+        q.sxR = sx1; q.sybR = yb1; q.sytR = yt1;
+    }
+    if (fabs(q.sxR - q.sxL) < 1.0e-6)
+        return false;
+    return true;
+}
+
+} // namespace Vis
+
+// Project a clipped world-space edge to screen and draw the wall quad.
+// Floor is at z=-1, ceiling at z=+1, viewer at z=0.
+inline void DrawWall(Edge *e,
+                     float x1, float y1, float x2, float y2,
+                     float vx, float vy, float cosD, float sinD,
+                     float focal) {
+    Vis::WallQuad q;
+    if (!Vis::ProjectWall(x1, y1, x2, y2, vx, vy, cosD, sinD, focal, q))
+        return;
+
+    glColor3f(e->color[0], e->color[1], e->color[2]);
+    glBegin(GL_POLYGON);
+        glVertex2f(q.sxL, q.sybL);
+        glVertex2f(q.sxR, q.sybR);
+        glVertex2f(q.sxR, q.sytR);
+        glVertex2f(q.sxL, q.sytL);
+    glEnd();
+}
+
+void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
+                       float cosD, float sinD, float focal,
+                       unsigned int frame) {
+    if (!cell)
+        return;
+    if (cell->counter == frame)
+        return;
+    cell->counter = frame;
+
+    for (int i = 0; i < 4; i++) {
+        Edge *e = cell->edges[i];
+        if (!e)
+            continue;
+        float x1 = e->endpoints[Edge::START]->posn[Vertex::X];
+        float y1 = e->endpoints[Edge::START]->posn[Vertex::Y];
+        float x2 = e->endpoints[Edge::END]->posn[Vertex::X];
+        float y2 = e->endpoints[Edge::END]->posn[Vertex::Y];
+
+        float cx1 = x1, cy1 = y1, cx2 = x2, cy2 = y2;
+        if (!Vis::ClipEdgeToFrustum(F, cx1, cy1, cx2, cy2))
+            continue; // not visible in this frustum
+
+        if (e->opaque) {
+            // Draw each opaque edge exactly once: only from the cell
+            // on the viewer's side of the edge (its front face).
+            // The other neighbor must skip it. This keeps exact
+            // visibility regardless of visit order: the viewing cell
+            // always holds the complete visible piece.
+            char side = e->Point_Side(F.vx, F.vy);
+            if (side != Edge::ON && e->neighbors[side] != cell)
+                continue;
+            DrawWall(e, cx1, cy1, cx2, cy2, F.vx, F.vy, cosD, sinD, focal);
+        } else {
+            Cell *n = e->Neighbor(cell);
+            if (!n)
+                continue;
+            if (n->counter == frame)
+                continue;
+            Vis::Frustum NF = Vis::RestrictFrustum(F, cx1, cy1, cx2, cy2);
+            if (!Vis::FrustumValid(NF))
+                continue;
+            DrawCellRecursive(n, NF, cosD, sinD, focal, frame);
+        }
+    }
+}
 
 const char Maze::X = 0;
 const char Maze::Y = 1;
@@ -632,10 +851,26 @@ Draw_View(const float focal_dist)
 {
 	frame_num++;
 
-	//###################################################################
-	// TODO
-	// The rest is up to you!
-	//###################################################################
+	// Build the initial view frustum from viewer state.
+	float dirRad = (float)To_Radians((double)viewer_dir);
+	float halfRad = (float)To_Radians((double)viewer_fov * 0.5);
+	float leftAng = dirRad + halfRad;
+	float rightAng = dirRad - halfRad;
+
+	Vis::Frustum F;
+	F.vx = viewer_posn[X];
+	F.vy = viewer_posn[Y];
+	F.lx = (float)cos(leftAng);
+	F.ly = (float)sin(leftAng);
+	F.rx = (float)cos(rightAng);
+	F.ry = (float)sin(rightAng);
+
+	float cosD = (float)cos(dirRad);
+	float sinD = (float)sin(dirRad);
+
+	// view_cell is maintained by Move_View_Posn / Find_View_Cell.
+	if (view_cell)
+		DrawCellRecursive(view_cell, F, cosD, sinD, focal_dist, frame_num);
 }
 
 

@@ -38,6 +38,14 @@ MazeWindow(int x, int y, int width, int height, const char *label,Maze *m)
 	// The mouse button isn't down and there is no key pressed.
 	down = false;
 	z_key = 0;
+
+	// No keyboard motion is in progress either. (These must be
+	// initialized: otherwise Update() may read garbage and move the
+	// viewer on its own.)
+	keyDown = false;
+	x_dirMove = 0.0f;
+	y_dirMove = 0.0f;
+	d_keyDown = 0.0f;
 }
 
 
@@ -70,25 +78,25 @@ draw(void)
 
 	if ( ! valid() ) {
 		// The OpenGL context may have been changed
-		// Set up the viewport to fill the window.
-		glViewport(0, 0, w(), h());
-
-		// We are using orthogonal viewing for 2D. This puts 0,0 in the
-		// middle of the screen, and makes the image size in view space
-		// the same size as the window.
-		gluOrtho2D(-w() * 0.5, w() * 0.5, -h() * 0.5, h() * 0.5);
-
 		// Sets the clear color to black.
 		glClearColor(0.0, 0.0, 0.0, 1.0);
 	}
 
-	// Clear the screen.
-	glClear(GL_COLOR_BUFFER_BIT);
-
+	// (Re)establish the viewport and the orthogonal projection every
+	// frame. We are using orthogonal viewing for 2D. This puts 0,0 in
+	// the middle of the screen, and makes the image size in view space
+	// the same size as the window (pixels). NOTE: gluOrtho2D must come
+	// AFTER glLoadIdentity, otherwise the projection is wiped out and
+	// everything collapses to the [-1,1] clip cube.
+	glViewport(0, 0, w(), h());
 	glMatrixMode(GL_PROJECTION);
 	glLoadIdentity();
+	gluOrtho2D(-w() * 0.5, w() * 0.5, -h() * 0.5, h() * 0.5);
 	glMatrixMode(GL_MODELVIEW);
 	glLoadIdentity();
+
+	// Clear the screen.
+	glClear(GL_COLOR_BUFFER_BIT);
 	glBegin(GL_QUADS);
 		// Draw the "floor". It is an infinite plane perpendicular to
 		// vertical, so we know it projects to cover the entire bottom
