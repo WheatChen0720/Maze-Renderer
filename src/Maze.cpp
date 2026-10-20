@@ -314,6 +314,22 @@ inline void DrawPoly(const float *color, const Poly &p) {
     glEnd();
 }
 
+// Shared "outside" look: blue sky above the horizon, green ground below.
+// Used by BOTH exterior windows and exterior doors so the outside reads
+// the same everywhere (indoor floor/ceiling stay dark/light gray).
+// The two quads partition the opening at y=0: no overdraw.
+inline void DrawOutside(float sxL, float ybL, float sxR, float ybR,
+                        float ytL, float ytR, const ScreenClip &clip) {
+    Poly outBot = QuadPoly(sxL, ybL, sxR, ybR, sxR, 0.0f, sxL, 0.0f);
+    Poly outTop = QuadPoly(sxL, 0.0f, sxR, 0.0f, sxR, ytR, sxL, ytL);
+    Poly ob = clip.active ? IntersectConvex(outBot, clip.poly) : outBot;
+    Poly ot = clip.active ? IntersectConvex(outTop, clip.poly) : outTop;
+    float ground[3] = { 0.25f, 0.50f, 0.25f };
+    float sky[3] = { 0.55f, 0.78f, 1.00f };
+    DrawPoly(ground, ob);
+    DrawPoly(sky, ot);
+}
+
 } // namespace Vis
 
 // Window test: opaque edge painted with sentinel glass color (0,1,1).
@@ -346,13 +362,13 @@ inline void DrawWall(Edge *e,
 void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
                        float cosD, float sinD, float focal,
                        unsigned int frame, const Vis::ScreenClip &clip,
-                       std::vector<Cell*> &path);
+                       std::vector<Cell*> &path, const Maze *mz);
 
 void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
                        float cosD, float sinD, float focal,
                        unsigned int frame, const Vis::ScreenClip &clip) {
     std::vector<Cell*> path;
-    DrawCellRecursive(cell, F, cosD, sinD, focal, frame, clip, path);
+    DrawCellRecursive(cell, F, cosD, sinD, focal, frame, clip, path, NULL);
 }
 
 void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
@@ -360,7 +376,7 @@ void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
                        unsigned int frame) {
     Vis::ScreenClip noClip;
     std::vector<Cell*> path;
-    DrawCellRecursive(cell, F, cosD, sinD, focal, frame, noClip, path);
+    DrawCellRecursive(cell, F, cosD, sinD, focal, frame, noClip, path, NULL);
 }
 
 static bool InPath(const std::vector<Cell*> &path, Cell *c) {
@@ -372,7 +388,7 @@ static bool InPath(const std::vector<Cell*> &path, Cell *c) {
 void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
                        float cosD, float sinD, float focal,
                        unsigned int frame, const Vis::ScreenClip &clip,
-                       std::vector<Cell*> &path) {
+                       std::vector<Cell*> &path, const Maze *mz) {
     if (!cell)
         return;
     // Path-based cycle guard (not global frame counter).
@@ -399,6 +415,49 @@ void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
         float cx1 = x1, cy1 = y1, cx2 = x2, cy2 = y2;
         if (!Vis::ClipEdgeToFrustum(F, cx1, cy1, cx2, cy2))
             continue; // not visible in this frustum
+
+        // Door (extra): sentinel red (1,0,0), sliding split.
+        // Closed frac=0 -> full wall; open frac=1 -> pure portal.
+        // Wall-segment and opening-segment partition the edge, opening
+        // recurses with narrowed frustum: no overdraw, 2D calls only.
+        bool isDoor = mz && mz->Is_Door_Edge(e);
+        if (isDoor) {
+            float frac = mz->Door_Frac(e);
+            if (frac < 0.0f) frac = 0.0f;
+            if (frac > 1.0f) frac = 1.0f;
+            float Mx = x1 + (1.0f - frac) * (x2 - x1);
+            float My = y1 + (1.0f - frac) * (y2 - y1);
+            // Closed panel part: [A, M].
+            float wx1 = x1, wy1 = y1, wx2 = Mx, wy2 = My;
+            if (Vis::ClipEdgeToFrustum(F, wx1, wy1, wx2, wy2)) {
+                char side = e->Point_Side(F.vx, F.vy);
+                if (side == Edge::ON || e->neighbors[side] == cell)
+                    DrawWall(e, wx1, wy1, wx2, wy2,
+                             F.vx, F.vy, cosD, sinD, focal, clip);
+            }
+            // Opening part: [M, B].
+            float ox1 = Mx, oy1 = My, ox2 = x2, oy2 = y2;
+            if (!Vis::ClipEdgeToFrustum(F, ox1, oy1, ox2, oy2))
+                continue;
+            Vis::Frustum NF = Vis::RestrictFrustum(F, ox1, oy1, ox2, oy2);
+            if (!Vis::FrustumValid(NF))
+                continue;
+            Cell *n = e->Neighbor(cell);
+            if (!n) {
+                // Exterior open door: same blue sky / green ground as
+                // exterior windows (floor/ceiling background = indoors).
+                Vis::WallQuad oq;
+                if (Vis::ProjectWall(ox1, oy1, ox2, oy2, F.vx, F.vy,
+                                     cosD, sinD, focal, oq))
+                    Vis::DrawOutside(oq.sxL, oq.sybL, oq.sxR, oq.sybR,
+                                     oq.sytL, oq.sytR, clip);
+                continue;
+            }
+            if (InPath(path, n))
+                continue;
+            DrawCellRecursive(n, NF, cosD, sinD, focal, frame, clip, path, mz);
+            continue;
+        }
 
         // Window: opaque glass wall with a horizontal slit opening.
         // opaque==true so collision still blocks walking; rendering draws
@@ -441,27 +500,15 @@ void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
                 continue;
             Cell *n = e->Neighbor(cell);
             if (!n) {
-                // Exterior window: show outside (sky above horizon,
-                // ground below). The two quads partition the opening,
-                // then are clipped to the incoming clip: no overdraw.
-                Vis::Poly outBot = Vis::QuadPoly(w.sxL, w.ysL, w.sxR, w.ysR,
-                                                  w.sxR, 0.0f, w.sxL, 0.0f);
-                Vis::Poly outTop = Vis::QuadPoly(w.sxL, 0.0f, w.sxR, 0.0f,
-                                                  w.sxR, w.ytR, w.sxL, w.ytL);
-                Vis::Poly ob = clip.active ?
-                    Vis::IntersectConvex(outBot, clip.poly) : outBot;
-                Vis::Poly ot = clip.active ?
-                    Vis::IntersectConvex(outTop, clip.poly) : outTop;
-                float ground[3] = { 0.25f, 0.50f, 0.25f };
-                float sky[3] = { 0.55f, 0.78f, 1.00f };
-                Vis::DrawPoly(ground, ob);
-                Vis::DrawPoly(sky, ot);
+                // Exterior window: same outside look as exterior doors.
+                Vis::DrawOutside(w.sxL, w.ysL, w.sxR, w.ysR,
+                                 w.ytL, w.ytR, clip);
                 continue;
             }
             if (InPath(path, n))
                 continue;
             Vis::ScreenClip nclip(true, newPoly);
-            DrawCellRecursive(n, NF, cosD, sinD, focal, frame, nclip, path);
+            DrawCellRecursive(n, NF, cosD, sinD, focal, frame, nclip, path, mz);
         } else if (e->opaque) {
             // Draw each opaque edge exactly once: only from the cell
             // on the viewer's side of the edge (its front face).
@@ -481,7 +528,7 @@ void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
             Vis::Frustum NF = Vis::RestrictFrustum(F, cx1, cy1, cx2, cy2);
             if (!Vis::FrustumValid(NF))
                 continue;
-            DrawCellRecursive(n, NF, cosD, sinD, focal, frame, clip, path);
+            DrawCellRecursive(n, NF, cosD, sinD, focal, frame, clip, path, mz);
         }
     }
     path.pop_back();
@@ -1060,7 +1107,7 @@ Toggle_Front_Window(void)
 
 	for (int i = 0; i < num_edges; i++) {
 		Edge *e = edges[i];
-		if (!e || !e->opaque)
+		if (!e || !e->opaque || Is_Door_Edge(e))
 			continue;
 		float Ax = e->endpoints[Edge::START]->posn[Vertex::X];
 		float Ay = e->endpoints[Edge::START]->posn[Vertex::Y];
@@ -1111,6 +1158,139 @@ Toggle_Front_Window(void)
 }
 
 
+//**********************************************************************
+//
+// * Extra (bonus): doors. Sentinel color (1,0,0). Closed = wall,
+//   open = portal. Sliding split: wall covers [A, A+(1-frac)*(B-A)],
+//   opening covers the rest. Exterior doors stay collision-closed so the
+//   player cannot leave the maze (visual still opens to sky/ground).
+//======================================================================
+bool Maze::Is_Door_Edge(const Edge *e) const {
+	if (!e)
+		return false;
+	return (e->color[0] > 0.95f && e->color[1] < 0.05f && e->color[2] < 0.05f);
+}
+
+float Maze::Door_Frac(const Edge *e) const {
+	if (!Is_Door_Edge(e))
+		return 0.0f;
+	auto it = doors.find(e->index);
+	if (it == doors.end())
+		return 0.0f; // sentinel doors start closed
+	return it->second.frac;
+}
+
+static bool RayHitEdge(float Px, float Py, float Dx, float Dy,
+                        float Ax, float Ay, float Bx, float By,
+                        float &tOut, float &uOut) {
+	float Ex = Bx - Ax, Ey = By - Ay;
+	float den = Dx * Ey - Dy * Ex;
+	if (fabs(den) < 1.0e-9)
+		return false;
+	float APx = Ax - Px, APy = Ay - Py;
+	float t = (APx * Ey - APy * Ex) / den;
+	float u = (APx * Dy - APy * Dx) / den;
+	tOut = t; uOut = u;
+	return true;
+}
+
+void Maze::
+Toggle_Nearest_Door(void)
+//======================================================================
+{
+	float dirRad = (float)To_Radians((double)viewer_dir);
+	float Dx = (float)cos(dirRad), Dy = (float)sin(dirRad);
+	float Px = viewer_posn[X], Py = viewer_posn[Y];
+	const float maxDist = 6.0f;
+
+	// 1) Prefer an existing door in front.
+	int bestDoor = -1;
+	float bestT = maxDist + 1.0f;
+	for (int i = 0; i < num_edges; i++) {
+		Edge *e = edges[i];
+		if (!Is_Door_Edge(e))
+			continue;
+		float Ax = e->endpoints[Edge::START]->posn[Vertex::X];
+		float Ay = e->endpoints[Edge::START]->posn[Vertex::Y];
+		float Bx = e->endpoints[Edge::END]->posn[Vertex::X];
+		float By = e->endpoints[Edge::END]->posn[Vertex::Y];
+		float t, u;
+		if (!RayHitEdge(Px, Py, Dx, Dy, Ax, Ay, Bx, By, t, u))
+			continue;
+		if (t < 0.05f || t > maxDist || u < 0.0f || u > 1.0f)
+			continue;
+		if (t < bestT) { bestT = t; bestDoor = i; }
+	}
+	if (bestDoor >= 0) {
+		int didx = edges[bestDoor]->index;
+		auto dit = doors.find(didx);
+		if (dit == doors.end())
+			doors[didx] = { true, 0.0f };
+		else
+			dit->second.targetOpen = !dit->second.targetOpen;
+
+		return;
+	}
+
+	// 2) No door in front: convert nearest opaque wall into a door and open it.
+	int best = -1;
+	bestT = maxDist + 1.0f;
+	for (int i = 0; i < num_edges; i++) {
+		Edge *e = edges[i];
+		if (!e || !e->opaque || Is_Door_Edge(e) || Is_Window_Edge(e))
+			continue;
+		float Ax = e->endpoints[Edge::START]->posn[Vertex::X];
+		float Ay = e->endpoints[Edge::START]->posn[Vertex::Y];
+		float Bx = e->endpoints[Edge::END]->posn[Vertex::X];
+		float By = e->endpoints[Edge::END]->posn[Vertex::Y];
+		float t, u;
+		if (!RayHitEdge(Px, Py, Dx, Dy, Ax, Ay, Bx, By, t, u))
+			continue;
+		if (t < 0.05f || t > maxDist || u < 0.0f || u > 1.0f)
+			continue;
+		if (t < bestT) { bestT = t; best = i; }
+	}
+	if (best < 0)
+		return;
+	Edge *e = edges[best];
+	if (door_orig_colors.find(e->index) == door_orig_colors.end())
+		door_orig_colors[e->index] = { e->color[0], e->color[1], e->color[2] };
+	e->color[0] = 1.0f; e->color[1] = 0.0f; e->color[2] = 0.0f;
+	doors[e->index] = { true, 0.0f }; // start closed, animate open
+	e->opaque = true;
+}
+
+bool Maze::
+Update_Doors(float dt)
+//======================================================================
+{
+	bool moved = false;
+	const float speed = 1.4f; // fraction per second
+	for (auto &kv : doors) {
+		int idx = kv.first;
+		if (idx < 0 || idx >= num_edges || !edges[idx])
+			continue;
+		DoorState &ds = kv.second;
+		float target = ds.targetOpen ? 1.0f : 0.0f;
+		if (fabs(ds.frac - target) < 1.0e-4f) {
+			ds.frac = target;
+		} else {
+			float dir = (target > ds.frac) ? 1.0f : -1.0f;
+			ds.frac += dir * speed * dt;
+			if ((dir > 0 && ds.frac > target) || (dir < 0 && ds.frac < target))
+				ds.frac = target;
+			moved = true;
+		}
+		Edge *e = edges[idx];
+		bool exterior = (!e->neighbors[0] || !e->neighbors[1]);
+		if (exterior)
+			e->opaque = true; // see outside but cannot leave the maze
+		else
+			e->opaque = (ds.frac < 0.5f);
+	}
+	return moved;
+}
+
 
 //**********************************************************************
 //
@@ -1134,9 +1314,10 @@ Draw_Map(int min_x, int min_y, int max_x, int max_y)
 	min_x += 5;
 	min_y += 5;
 
-	// Draw all the opaque edges.
+	// Draw all the opaque edges, plus doors even when open (so the
+	// player can find them on the map; doors are sentinel red).
 	for ( i = 0 ; i < num_edges ; i++ )
-		if ( edges[i]->opaque )	{
+		if ( edges[i]->opaque || Is_Door_Edge(edges[i]) )	{
 			float   x1, y1, x2, y2;
 
 			x1 = edges[i]->endpoints[Edge::START]->posn[Vertex::X];
@@ -1185,8 +1366,12 @@ Draw_View(const float focal_dist)
 	float sinD = (float)sin(dirRad);
 
 	// view_cell is maintained by Move_View_Posn / Find_View_Cell.
-	if (view_cell)
-		DrawCellRecursive(view_cell, F, cosD, sinD, focal_dist, frame_num);
+	if (view_cell) {
+		Vis::ScreenClip noClip;
+		std::vector<Cell*> path;
+		DrawCellRecursive(view_cell, F, cosD, sinD, focal_dist, frame_num,
+		                  noClip, path, this);
+	}
 }
 
 

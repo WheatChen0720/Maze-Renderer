@@ -199,13 +199,19 @@ Update(float dt)
 {
 	// Update the view
 
-	if ( down || z_key ) // Only do anything if the mouse button is down.
-		return Drag(dt);
-	if ( keyDown )
-		return KeyEvent(dt);
-	
-	// Nothing changed, so no need for a redraw.
-	return false;
+	bool anim = maze ? maze->Update_Doors(dt) : false;
+
+	if ( down || z_key ) { // Only do anything if the mouse button is down.
+		Drag(dt);
+		return true;
+	}
+	if ( keyDown ) {
+		KeyEvent(dt);
+		return true;
+	}
+
+	// Doors animate even when the player stands still.
+	return anim;
 }
 
 
@@ -242,6 +248,15 @@ handle(int event)
 				// One-shot action; request redraw immediately.
 				if (maze) {
 					maze->Toggle_Front_Window();
+					redraw();
+				}
+				return 1;
+			}
+			if (Fl::event_key() == 'e' || Fl::event_key() == 'E') {
+				// Extra: doors. Toggles nearest door open/closed; if no door
+				// in front, converts the nearest wall into a door and opens it.
+				if (maze) {
+					maze->Toggle_Nearest_Door();
 					redraw();
 				}
 				return 1;

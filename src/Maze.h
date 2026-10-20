@@ -113,6 +113,22 @@ class Maze {
 		// into/out of a window. Bound to the G key for the demo.
 		void	Toggle_Front_Window(void);
 
+		// ---- Extra: doors (openable) ----
+		// A door is an edge painted with sentinel door color (1,0,0).
+		// Closed (frac=0) renders as a full wall and blocks walking;
+		// open (frac=1) renders as a pure portal and lets the player pass.
+		// Half-open splits the edge into wall-segment + opening-segment.
+		// Animation runs in Update_Doors(dt). Uses ONLY allowed 2D calls.
+		struct DoorState { bool targetOpen; float frac; };
+		bool	Is_Door_Edge(const Edge *e) const;
+		float	Door_Frac(const Edge *e) const;
+		// E key: toggle nearest door; if no door in front, convert the
+		// nearest opaque wall into a door and open it.
+		void	Toggle_Nearest_Door(void);
+		// Advance door animations; returns true if any door moved (needs redraw).
+		// Also syncs edge->opaque so collision matches visual state.
+		bool	Update_Doors(float dt);
+
 		// Save the maze to a file of the given name.
 		bool	Save(const char*);
 
@@ -123,6 +139,10 @@ class Maze {
 		// Backup of wall colors converted to windows (edge index -> rgb),
 		// so Toggle_Front_Window can restore them.
 		std::map<int, std::array<float, 3>>	window_orig_colors;
+		// Door animation state by edge index, plus original colors of walls
+		// converted into doors.
+		std::map<int, DoorState>				doors;
+		std::map<int, std::array<float, 3>>	door_orig_colors;
 
 	private:
 		// Functions used when creating or loading a maze.
