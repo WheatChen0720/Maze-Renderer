@@ -237,6 +237,15 @@ handle(int event)
 			return 1;
 		case FL_KEYDOWN:
 			keyDown = true;
+			if (Fl::event_key() == 'g' || Fl::event_key() == 'G') {
+				// Extra: toggle nearest wall in front into/out of a window.
+				// One-shot action; request redraw immediately.
+				if (maze) {
+					maze->Toggle_Front_Window();
+					redraw();
+				}
+				return 1;
+			}
 			if (Fl::event_key() == 'w') {
 				x_dirMove = (float)cos(Maze::To_Radians(maze->viewer_dir));
 				y_dirMove = (float)sin(Maze::To_Radians(maze->viewer_dir));

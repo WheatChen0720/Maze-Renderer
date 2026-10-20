@@ -20,6 +20,8 @@
 #define _MAZE_H_
 
 #include <FL/math.h> // Use FLTK's math header because it defines M_PI
+#include <map>
+#include <array>
 #include "Cell.h"
 
 //************************************************************************
@@ -98,12 +100,30 @@ class Maze {
 		// THIS IS THE FUINCTION YOU SHOULD MODIFY.
 		void	Draw_View(const float);
 
+		// ---- Extra: windows (glass) ----
+		// A window is an opaque edge (still blocks walking) whose color is
+		// the sentinel glass color (0,1,1). It is rendered as a wall with a
+		// horizontal opening: lower/upper solid parts are drawn, the middle
+		// is see-through (portal) with exact-visibility screen-space clipping.
+		// Works for interior windows (see neighbor cell) and exterior windows
+		// (see outside sky/ground). Uses ONLY glColor3f/glBegin(GL_POLYGON)/
+		// glVertex2f/glEnd, plus own projection math.
+		bool	Is_Window_Edge(const Edge *e) const;
+		// Ray-cast forward from the viewer and toggle the nearest opaque wall
+		// into/out of a window. Bound to the G key for the demo.
+		void	Toggle_Front_Window(void);
+
 		// Save the maze to a file of the given name.
 		bool	Save(const char*);
 
 		// Functions to convert between degrees and radians.
 		static double   To_Radians(double deg) { return deg / 180.0 * M_PI; };
 		static double   To_Degrees(double rad) { return rad * 180.0 / M_PI; };
+	private:
+		// Backup of wall colors converted to windows (edge index -> rgb),
+		// so Toggle_Front_Window can restore them.
+		std::map<int, std::array<float, 3>>	window_orig_colors;
+
 	private:
 		// Functions used when creating or loading a maze.
 

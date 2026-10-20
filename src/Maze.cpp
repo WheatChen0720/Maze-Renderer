@@ -17,11 +17,13 @@
 *************************************************************************/
 
 #include "Maze.h"
+#include "LineSeg.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
 #include <time.h>
+#include <vector>
 #include <FL/Fl.h>
 #include <FL/fl_draw.h>
 #include <FL/gl.h>
@@ -33,6 +35,14 @@
 // View space: x_v = forward, y_v = left.
 // Screen (OpenGL 2D, origin at center): x right, y up,
 // screen_x = -focal * y_v / x_v, screen_y = focal * z / x_v.
+//
+// EXTRA (windows, for bonus points):
+// A window edge is opaque (blocks walking) but has a see-through
+// horizontal slit in world-Z: [WINDOW_SILL, WINDOW_TOP].
+// It is drawn as two solid quads (below sill, above top) plus a portal
+// opening. Everything behind is screen-space clipped to the opening quad,
+// so no pixel (apart from floor/ceiling background) is drawn twice.
+// Only glColor3f / glBegin(GL_POLYGON) / glVertex2f / glEnd are used.
 //###################################################################
 namespace Vis {
 
@@ -41,6 +51,10 @@ struct Frustum {
     float lx, ly;   // unit vector along left boundary
     float rx, ry;   // unit vector along right boundary
 };
+
+// Window slit in world Z. Must stay strictly inside (-1, 1).
+const float WINDOW_SILL = -0.35f;
+const float WINDOW_TOP  =  0.45f;
 
 inline float Cross2(float ax, float ay, float bx, float by) {
     return ax * by - ay * bx;
@@ -177,35 +191,201 @@ inline bool ProjectWall(float x1, float y1, float x2, float y2,
     return true;
 }
 
+// Window projection: full wall plus sill/top heights, left->right.
+struct WindowProj {
+    float sxL, sxR;
+    float ybL, ybR;   // z = -1
+    float ysL, ysR;   // z = SILL
+    float ytL, ytR;   // z = TOP
+    float ycL, ycR;   // z = +1
+};
+
+inline bool ProjectWindow(float x1, float y1, float x2, float y2,
+                          float vx, float vy, float cosD, float sinD,
+                          float focal, WindowProj &w) {
+    float dx1 = x1 - vx, dy1 = y1 - vy;
+    float dx2 = x2 - vx, dy2 = y2 - vy;
+    float xf1 = dx1 * cosD + dy1 * sinD;
+    float yl1 = -dx1 * sinD + dy1 * cosD;
+    float xf2 = dx2 * cosD + dy2 * sinD;
+    float yl2 = -dx2 * sinD + dy2 * cosD;
+    if (xf1 < 1.0e-6f) xf1 = 1.0e-6f;
+    if (xf2 < 1.0e-6f) xf2 = 1.0e-6f;
+    float sx1 = -focal * yl1 / xf1;
+    float sx2 = -focal * yl2 / xf2;
+    float yb1 = -focal / xf1, ys1 = focal * WINDOW_SILL / xf1;
+    float yt1 = focal * WINDOW_TOP / xf1, yc1 = focal / xf1;
+    float yb2 = -focal / xf2, ys2 = focal * WINDOW_SILL / xf2;
+    float yt2 = focal * WINDOW_TOP / xf2, yc2 = focal / xf2;
+    if (sx1 <= sx2) {
+        w.sxL = sx1; w.ybL = yb1; w.ysL = ys1; w.ytL = yt1; w.ycL = yc1;
+        w.sxR = sx2; w.ybR = yb2; w.ysR = ys2; w.ytR = yt2; w.ycR = yc2;
+    } else {
+        w.sxL = sx2; w.ybL = yb2; w.ysL = ys2; w.ytL = yt2; w.ycL = yc2;
+        w.sxR = sx1; w.ybR = yb1; w.ysR = ys1; w.ytR = yt1; w.ycR = yc1;
+    }
+    if (fabs(w.sxR - w.sxL) < 1.0e-6)
+        return false;
+    return true;
+}
+
+// ---- Screen-space convex-polygon clipping (Sutherland-Hodgman) ----
+// All polygons here are convex and CCW: BL -> BR -> TR -> TL.
+struct Vec2 { float x, y; };
+typedef std::vector<Vec2> Poly;
+
+inline Vec2 IntersectLines(Vec2 p1, Vec2 p2, Vec2 a, Vec2 b) {
+    float d1x = p2.x - p1.x, d1y = p2.y - p1.y;
+    float d2x = b.x - a.x, d2y = b.y - a.y;
+    float det = d1x * d2y - d1y * d2x; // cross(d1, d2)
+    Vec2 out = p1;
+    if (fabs(det) < 1.0e-12)
+        return out;
+    // t = cross(a - p1, d2) / cross(d1, d2)
+    float t = ((a.x - p1.x) * d2y - (a.y - p1.y) * d2x) / det;
+    out.x = p1.x + t * d1x;
+    out.y = p1.y + t * d1y;
+    return out;
+}
+
+inline Poly ClipPolyAgainstEdge(const Poly &subj, Vec2 a, Vec2 b) {
+    Poly out;
+    if (subj.empty())
+        return out;
+    const float EPS = 1.0e-6f;
+    for (size_t i = 0; i < subj.size(); i++) {
+        Vec2 cur = subj[i];
+        Vec2 prev = subj[(i + subj.size() - 1) % subj.size()];
+        float cCur = (b.x - a.x) * (cur.y - a.y) - (b.y - a.y) * (cur.x - a.x);
+        float cPrev = (b.x - a.x) * (prev.y - a.y) - (b.y - a.y) * (prev.x - a.x);
+        bool inCur = (cCur >= -EPS);
+        bool inPrev = (cPrev >= -EPS);
+        if (inCur) {
+            if (!inPrev)
+                out.push_back(IntersectLines(prev, cur, a, b));
+            out.push_back(cur);
+        } else if (inPrev) {
+            out.push_back(IntersectLines(prev, cur, a, b));
+        }
+    }
+    return out;
+}
+
+inline Poly IntersectConvex(const Poly &subj, const Poly &clip) {
+    if (subj.empty() || clip.empty())
+        return Poly();
+    Poly out = subj;
+    for (size_t j = 0; j < clip.size(); j++) {
+        Vec2 a = clip[j];
+        Vec2 b = clip[(j + 1) % clip.size()];
+        out = ClipPolyAgainstEdge(out, a, b);
+        if (out.empty())
+            break;
+    }
+    return out;
+}
+
+inline Poly QuadPoly(float sxL, float yL0, float sxR, float yR0,
+                     float sxR2, float yR1, float sxL2, float yL1) {
+    Poly p;
+    Vec2 v;
+    v.x = sxL; v.y = yL0; p.push_back(v);
+    v.x = sxR; v.y = yR0; p.push_back(v);
+    v.x = sxR2; v.y = yR1; p.push_back(v);
+    v.x = sxL2; v.y = yL1; p.push_back(v);
+    return p;
+}
+
+struct ScreenClip {
+    bool active;
+    Poly poly;
+    ScreenClip() : active(false) {}
+    ScreenClip(bool a, const Poly &p) : active(a), poly(p) {}
+};
+
+// Draw a screen-space polygon with 2D calls only.
+inline void DrawPoly(const float *color, const Poly &p) {
+    if (p.size() < 3)
+        return;
+    glColor3f(color[0], color[1], color[2]);
+    glBegin(GL_POLYGON);
+    for (size_t i = 0; i < p.size(); i++)
+        glVertex2f(p[i].x, p[i].y);
+    glEnd();
+}
+
 } // namespace Vis
+
+// Window test: opaque edge painted with sentinel glass color (0,1,1).
+// Random BuildMaze colors live in [0.25, 0.75], so this never fires
+// accidentally. Users/TA can make any wall a window by editing the maze
+// file color to "0 1 1", or by pressing G in front of a wall.
+bool Maze::Is_Window_Edge(const Edge *e) const {
+    if (!e || !e->opaque)
+        return false;
+    return (e->color[0] < 0.05f && e->color[1] > 0.95f && e->color[2] > 0.95f);
+}
 
 // Project a clipped world-space edge to screen and draw the wall quad.
 // Floor is at z=-1, ceiling at z=+1, viewer at z=0.
+// Honors the incoming screen-space clip (for views through windows).
 inline void DrawWall(Edge *e,
                      float x1, float y1, float x2, float y2,
                      float vx, float vy, float cosD, float sinD,
-                     float focal) {
+                     float focal, const Vis::ScreenClip &clip) {
     Vis::WallQuad q;
     if (!Vis::ProjectWall(x1, y1, x2, y2, vx, vy, cosD, sinD, focal, q))
         return;
+    Vis::Poly wall = Vis::QuadPoly(q.sxL, q.sybL, q.sxR, q.sybR,
+                                   q.sxR, q.sytR, q.sxL, q.sytL);
+    Vis::Poly todraw = clip.active ? Vis::IntersectConvex(wall, clip.poly) : wall;
+    float c[3] = { e->color[0], e->color[1], e->color[2] };
+    Vis::DrawPoly(c, todraw);
+}
 
-    glColor3f(e->color[0], e->color[1], e->color[2]);
-    glBegin(GL_POLYGON);
-        glVertex2f(q.sxL, q.sybL);
-        glVertex2f(q.sxR, q.sybR);
-        glVertex2f(q.sxR, q.sytR);
-        glVertex2f(q.sxL, q.sytL);
-    glEnd();
+void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
+                       float cosD, float sinD, float focal,
+                       unsigned int frame, const Vis::ScreenClip &clip,
+                       std::vector<Cell*> &path);
+
+void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
+                       float cosD, float sinD, float focal,
+                       unsigned int frame, const Vis::ScreenClip &clip) {
+    std::vector<Cell*> path;
+    DrawCellRecursive(cell, F, cosD, sinD, focal, frame, clip, path);
 }
 
 void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
                        float cosD, float sinD, float focal,
                        unsigned int frame) {
+    Vis::ScreenClip noClip;
+    std::vector<Cell*> path;
+    DrawCellRecursive(cell, F, cosD, sinD, focal, frame, noClip, path);
+}
+
+static bool InPath(const std::vector<Cell*> &path, Cell *c) {
+    for (size_t k = 0; k < path.size(); k++)
+        if (path[k] == c) return true;
+    return false;
+}
+
+void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
+                       float cosD, float sinD, float focal,
+                       unsigned int frame, const Vis::ScreenClip &clip,
+                       std::vector<Cell*> &path) {
     if (!cell)
         return;
-    if (cell->counter == frame)
+    // Path-based cycle guard (not global frame counter).
+    // Windows add portal loops to the transparent spanning tree, so the same
+    // cell can be legitimately reached via two disjoint frusta (directly
+    // through the window vs. the long way around). A global visited flag
+    // lets whichever branch runs first win and culls the other, which
+    // flickers as the frustum changes with forward/backward motion.
+    // Branches from one cell have disjoint angular intervals, so redrawing
+    // via another path does not overdraw: keep only anti-cycle on the stack.
+    if (InPath(path, cell))
         return;
-    cell->counter = frame;
+    path.push_back(cell);
 
     for (int i = 0; i < 4; i++) {
         Edge *e = cell->edges[i];
@@ -220,7 +400,69 @@ void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
         if (!Vis::ClipEdgeToFrustum(F, cx1, cy1, cx2, cy2))
             continue; // not visible in this frustum
 
-        if (e->opaque) {
+        // Window: opaque glass wall with a horizontal slit opening.
+        // opaque==true so collision still blocks walking; rendering draws
+        // lower/upper solids and recurses through the opening as a portal.
+        bool isWindow = (e->opaque &&
+                         e->color[0] < 0.05f && e->color[1] > 0.95f &&
+                         e->color[2] > 0.95f);
+        if (isWindow) {
+            // Exact-visibility: only the front face owns this edge.
+            char side = e->Point_Side(F.vx, F.vy);
+            if (side != Edge::ON && e->neighbors[side] != cell)
+                continue;
+            Vis::WindowProj w;
+            if (!Vis::ProjectWindow(cx1, cy1, cx2, cy2,
+                                    F.vx, F.vy, cosD, sinD, focal, w))
+                continue;
+            // Partition of the full wall quad: bottom solid, opening, top.
+            Vis::Poly bot = Vis::QuadPoly(w.sxL, w.ybL, w.sxR, w.ybR,
+                                           w.sxR, w.ysR, w.sxL, w.ysL);
+            Vis::Poly top = Vis::QuadPoly(w.sxL, w.ytL, w.sxR, w.ytR,
+                                           w.sxR, w.ycR, w.sxL, w.ycL);
+            Vis::Poly open = Vis::QuadPoly(w.sxL, w.ysL, w.sxR, w.ysR,
+                                            w.sxR, w.ytR, w.sxL, w.ytL);
+            // Frame tint for solids so the window reads as a frame,
+            // still disjoint from the opening (no overdraw).
+            float frameC[3] = { 0.10f, 0.45f, 0.55f };
+            Vis::Poly botC = clip.active ?
+                Vis::IntersectConvex(bot, clip.poly) : bot;
+            Vis::Poly topC = clip.active ?
+                Vis::IntersectConvex(top, clip.poly) : top;
+            Vis::DrawPoly(frameC, botC);
+            Vis::DrawPoly(frameC, topC);
+
+            Vis::Poly newPoly = clip.active ?
+                Vis::IntersectConvex(open, clip.poly) : open;
+            if (newPoly.size() < 3)
+                continue;
+            Vis::Frustum NF = Vis::RestrictFrustum(F, cx1, cy1, cx2, cy2);
+            if (!Vis::FrustumValid(NF))
+                continue;
+            Cell *n = e->Neighbor(cell);
+            if (!n) {
+                // Exterior window: show outside (sky above horizon,
+                // ground below). The two quads partition the opening,
+                // then are clipped to the incoming clip: no overdraw.
+                Vis::Poly outBot = Vis::QuadPoly(w.sxL, w.ysL, w.sxR, w.ysR,
+                                                  w.sxR, 0.0f, w.sxL, 0.0f);
+                Vis::Poly outTop = Vis::QuadPoly(w.sxL, 0.0f, w.sxR, 0.0f,
+                                                  w.sxR, w.ytR, w.sxL, w.ytL);
+                Vis::Poly ob = clip.active ?
+                    Vis::IntersectConvex(outBot, clip.poly) : outBot;
+                Vis::Poly ot = clip.active ?
+                    Vis::IntersectConvex(outTop, clip.poly) : outTop;
+                float ground[3] = { 0.25f, 0.50f, 0.25f };
+                float sky[3] = { 0.55f, 0.78f, 1.00f };
+                Vis::DrawPoly(ground, ob);
+                Vis::DrawPoly(sky, ot);
+                continue;
+            }
+            if (InPath(path, n))
+                continue;
+            Vis::ScreenClip nclip(true, newPoly);
+            DrawCellRecursive(n, NF, cosD, sinD, focal, frame, nclip, path);
+        } else if (e->opaque) {
             // Draw each opaque edge exactly once: only from the cell
             // on the viewer's side of the edge (its front face).
             // The other neighbor must skip it. This keeps exact
@@ -229,19 +471,20 @@ void DrawCellRecursive(Cell *cell, const Vis::Frustum &F,
             char side = e->Point_Side(F.vx, F.vy);
             if (side != Edge::ON && e->neighbors[side] != cell)
                 continue;
-            DrawWall(e, cx1, cy1, cx2, cy2, F.vx, F.vy, cosD, sinD, focal);
+            DrawWall(e, cx1, cy1, cx2, cy2, F.vx, F.vy, cosD, sinD, focal, clip);
         } else {
             Cell *n = e->Neighbor(cell);
             if (!n)
                 continue;
-            if (n->counter == frame)
+            if (InPath(path, n))
                 continue;
             Vis::Frustum NF = Vis::RestrictFrustum(F, cx1, cy1, cx2, cy2);
             if (!Vis::FrustumValid(NF))
                 continue;
-            DrawCellRecursive(n, NF, cosD, sinD, focal, frame);
+            DrawCellRecursive(n, NF, cosD, sinD, focal, frame, clip, path);
         }
     }
+    path.pop_back();
 }
 
 const char Maze::X = 0;
@@ -794,6 +1037,79 @@ Set_View_FOV(const float f)
 {
 	viewer_fov = f;
 }
+
+
+//**********************************************************************
+//
+// * Extra (bonus): toggle the nearest opaque wall in front of the viewer
+//   into/out of a window (sentinel glass color 0,1,1).
+//   Ray-casts along viewer_dir up to 6 units. Windows stay opaque so
+//   collision still blocks walking; only rendering treats them as glass.
+//======================================================================
+void Maze::
+Toggle_Front_Window(void)
+//======================================================================
+{
+	float dirRad = (float)To_Radians((double)viewer_dir);
+	float Dx = (float)cos(dirRad), Dy = (float)sin(dirRad);
+	float Px = viewer_posn[X], Py = viewer_posn[Y];
+	const float maxDist = 6.0f;
+
+	int best = -1;
+	float bestT = maxDist + 1.0f;
+
+	for (int i = 0; i < num_edges; i++) {
+		Edge *e = edges[i];
+		if (!e || !e->opaque)
+			continue;
+		float Ax = e->endpoints[Edge::START]->posn[Vertex::X];
+		float Ay = e->endpoints[Edge::START]->posn[Vertex::Y];
+		float Bx = e->endpoints[Edge::END]->posn[Vertex::X];
+		float By = e->endpoints[Edge::END]->posn[Vertex::Y];
+		float Ex = Bx - Ax, Ey = By - Ay;
+		float den = Dx * Ey - Dy * Ex; // cross(D, E)
+		if (fabs(den) < 1.0e-9)
+			continue; // parallel
+		float APx = Ax - Px, APy = Ay - Py;
+		float t = (APx * Ey - APy * Ex) / den; // dist along ray
+		float u = (APx * Dy - APy * Dx) / den; // param along edge (same den)
+		// Note: u = cross(A-P, D)/cross(D, E); derived sign gives u in [0,1]
+		// with the formula above up to sign; accept with fabs check:
+		// Recompute with stable form:
+		// t = cross(A-P, E)/cross(D,E), u = cross(A-P, D)/cross(D,E)
+		// cross(A-P,E) = APx*Ey - APy*Ex, cross(A-P,D) = APx*Dy - APy*Dx
+		// cross(D,E) = den. So u = (APx*Dy - APy*Dx)/den.
+		if (t < 0.05f || t > maxDist)
+			continue;
+		if (u < 0.0f || u > 1.0f)
+			continue;
+		if (t < bestT) {
+			bestT = t;
+			best = i;
+		}
+	}
+
+	if (best < 0)
+		return;
+
+	Edge *e = edges[best];
+	if (Is_Window_Edge(e)) {
+		auto it = window_orig_colors.find(e->index);
+		if (it != window_orig_colors.end()) {
+			e->color[0] = it->second[0];
+			e->color[1] = it->second[1];
+			e->color[2] = it->second[2];
+			window_orig_colors.erase(it);
+		} else {
+			e->color[0] = 0.7f; e->color[1] = 0.7f; e->color[2] = 0.7f;
+		}
+	} else {
+		std::array<float, 3> orig = { e->color[0], e->color[1], e->color[2] };
+		window_orig_colors[e->index] = orig;
+		e->color[0] = 0.0f; e->color[1] = 1.0f; e->color[2] = 1.0f;
+	}
+}
+
 
 
 //**********************************************************************
